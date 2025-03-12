@@ -9,8 +9,10 @@ import (
 
 // Constants for RabbitMQ configuration
 const (
-	rabbitMQURL = "amqp://guest:guest@localhost:5672/"
-	queueName   = "send_message"
+	rabbitMQURL  = "amqp://guest:guest@localhost:5672/"
+	queueName    = "send_message"
+	exchangeName = "default_exchange"
+	exchangeType = "direct"
 )
 
 // MessageHandler is a function type for processing messages
@@ -38,6 +40,22 @@ func NewWorker(handler MessageHandler) (*Worker, error) {
 		return nil, fmt.Errorf("failed to open a channel: %w", err)
 	}
 
+	// Declare the exchange
+	err = ch.ExchangeDeclare(
+		exchangeName, // Exchange name
+		exchangeType, // Exchange type
+		false,        // Durable (set to false to match the existing exchange)
+		false,        // Auto-deleted
+		false,        // Internal
+		false,        // No-wait
+		nil,          // Arguments
+	)
+	if err != nil {
+		ch.Close()
+		conn.Close()
+		return nil, fmt.Errorf("failed to declare an exchange: %w", err)
+	}
+
 	// Declare queue
 	q, err := ch.QueueDeclare(
 		queueName,
@@ -51,6 +69,20 @@ func NewWorker(handler MessageHandler) (*Worker, error) {
 		ch.Close()
 		conn.Close()
 		return nil, fmt.Errorf("failed to declare a queue: %w", err)
+	}
+
+	// Bind the queue to the exchange
+	err = ch.QueueBind(
+		q.Name,       // Queue name
+		q.Name,       // Routing key (same as queue name for direct exchange)
+		exchangeName, // Exchange
+		false,        // No-wait
+		nil,          // Arguments
+	)
+	if err != nil {
+		ch.Close()
+		conn.Close()
+		return nil, fmt.Errorf("failed to bind queue to exchange: %w", err)
 	}
 
 	return &Worker{

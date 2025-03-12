@@ -10,7 +10,7 @@ def generate_data():
         password="yourpassword",
     )
     progress.connect()
-    for i in range(500):
+    for i in range(10):
         result = progress.execute_query("INSERT INTO messages (message, phone_number) VALUES (%s, %s) RETURNING id", (f"Process data {i}", f"+1234567890{i}"))
         if not result:
             continue
