@@ -18,7 +18,7 @@ def generate_data():
     progress.close()
 
 def main():
-    producer = Producer("send_message")
+    producer = Producer("send_message_queue")
     for data in generate_data():
         print(f'[x] sending message id {data}')
         producer.send_message(f'{data}')

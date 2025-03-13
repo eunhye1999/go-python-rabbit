@@ -18,10 +18,12 @@ def generate_data():
     progress.close()
 
 def main():
-    producer = Producer("send_message")
+    producer = Producer("send_message_queue")
     for data in generate_data():
-        print(f'[x] sending message id {data}')
-        producer.send_message(f'{data}')
+        message_id = str(data)
+        print(f'[x] sending message id {message_id}')
+        # Use direct exchange type to match worker configuration
+        producer.send_message(message_id, exchange_type="direct")
         time.sleep(0.1)
     producer.close()
 

@@ -7,16 +7,13 @@ class Producer:
         self.queue_name = queue_name
         self.connection = pika.BlockingConnection(pika.URLParameters(RABBITMQ_URL))
         self.channel = self.connection.channel()
-        self.channel.queue_declare(queue=self.queue_name, durable=True)  # Ensure queue exists
-
-    # def send_message(self, message: str):
-    #     self.channel.basic_publish(
-    #         exchange="",
-    #         routing_key=self.queue_name,
-    #         body=message,
-    #         properties=pika.BasicProperties(delivery_mode=2),  # Persistent message
-    #     )
-    #     print(f" [x] Sent: {message}")
+        
+        # Declare queue with the same dead-letter configuration as in the worker
+        args = {
+            "x-dead-letter-exchange": "send_message_delay_exchange",
+            "x-dead-letter-routing-key": "send_message_retry_queue",
+        }
+        self.channel.queue_declare(queue=self.queue_name, durable=True, arguments=args)
 
     def close(self):
         """Closes the RabbitMQ connection."""
@@ -25,7 +22,7 @@ class Producer:
 
     def _get_exchange_and_routing_key(self, exchange_type: str) -> tuple:
         if exchange_type == "direct":
-            return "default_exchange", self.queue_name
+            return "send_message_exchange", self.queue_name
         elif exchange_type == "headers":
             return "headers_exchange", ""  # Headers exchange does not need a routing key
         else:
@@ -39,7 +36,8 @@ class Producer:
         exchange, routing_key = self._get_exchange_and_routing_key(exchange_type)
         exchange_type = self._validate_exchange_type(exchange_type)
 
-        self.channel.exchange_declare(exchange=exchange, exchange_type=exchange_type)
+        # Declare the exchange to ensure it exists
+        self.channel.exchange_declare(exchange=exchange, exchange_type=exchange_type, durable=True)
 
         if exchange_type == "headers" and headers is not None:
             # Set headers for routing in a headers exchange

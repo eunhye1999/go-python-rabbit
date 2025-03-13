@@ -3,26 +3,33 @@ package pkg
 import (
 	"fmt"
 	"log"
+	"strconv"
+	"time"
 
 	"github.com/streadway/amqp"
 )
 
 // Constants for RabbitMQ configuration
 const (
-	rabbitMQURL  = "amqp://guest:guest@localhost:5672/"
-	queueName    = "send_message"
-	exchangeName = "default_exchange"
-	exchangeType = "direct"
+	rabbitMQURL       = "amqp://guest:guest@localhost:5672/"
+	queueName         = "send_message_queue"
+	exchangeName      = "send_message_exchange"
+	exchangeType      = "direct"
+	delayExchangeName = "send_message_delay_exchange"
+	retryQueueName    = "send_message_retry_queue"
+	maxRetries        = 3
+	retryDelay        = 1 * time.Minute // 1 minute retry delay
 )
 
 // MessageHandler is a function type for processing messages
-type MessageHandler func(string)
+type MessageHandler func(string, map[string]interface{}) error
 
 // Worker represents a RabbitMQ message consumer
 type Worker struct {
 	conn          *amqp.Connection
 	channel       *amqp.Channel
 	queue         amqp.Queue
+	retryQueue    amqp.Queue
 	handleMessage MessageHandler
 }
 
@@ -40,38 +47,81 @@ func NewWorker(handler MessageHandler) (*Worker, error) {
 		return nil, fmt.Errorf("failed to open a channel: %w", err)
 	}
 
-	// Declare the exchange
+	fmt.Println("Declaring main exchange")
+	// Declare the main exchange
 	err = ch.ExchangeDeclare(
 		exchangeName, // Exchange name
 		exchangeType, // Exchange type
-		false,        // Durable (set to false to match the existing exchange)
+		true,         // Durable
 		false,        // Auto-deleted
 		false,        // Internal
 		false,        // No-wait
 		nil,          // Arguments
 	)
+	fmt.Println("Declaring main exchange done", err)
 	if err != nil {
 		ch.Close()
 		conn.Close()
 		return nil, fmt.Errorf("failed to declare an exchange: %w", err)
 	}
 
-	// Declare queue
+	fmt.Println("Declaring delay exchange")
+	// Declare the delay exchange for retries
+	err = ch.ExchangeDeclare(
+		delayExchangeName, // Exchange name
+		exchangeType,      // Exchange type (direct)
+		true,              // Durable
+		false,             // Auto-deleted
+		false,             // Internal
+		false,             // No-wait
+		nil,               // Arguments
+	)
+	if err != nil {
+		ch.Close()
+		conn.Close()
+		return nil, fmt.Errorf("failed to declare delay exchange: %w", err)
+	}
+
+	// Declare the main queue with dead letter config
+	args := amqp.Table{
+		"x-dead-letter-exchange":    delayExchangeName,
+		"x-dead-letter-routing-key": retryQueueName,
+	}
 	q, err := ch.QueueDeclare(
 		queueName,
 		true,  // Durable
 		false, // Auto delete
 		false, // Exclusive
 		false, // No-wait
-		nil,   // Arguments
+		args,  // Arguments with DLX config
 	)
 	if err != nil {
 		ch.Close()
 		conn.Close()
-		return nil, fmt.Errorf("failed to declare a queue: %w", err)
+		return nil, fmt.Errorf("failed to declare main queue: %w", err)
 	}
 
-	// Bind the queue to the exchange
+	// Declare retry queue with TTL and dead letter config
+	retryArgs := amqp.Table{
+		"x-dead-letter-exchange":    exchangeName,
+		"x-dead-letter-routing-key": queueName,
+		"x-message-ttl":             int32(retryDelay.Milliseconds()),
+	}
+	retryQueue, err := ch.QueueDeclare(
+		retryQueueName,
+		true,  // Durable
+		false, // Auto delete
+		false, // Exclusive
+		false, // No-wait
+		retryArgs,
+	)
+	if err != nil {
+		ch.Close()
+		conn.Close()
+		return nil, fmt.Errorf("failed to declare retry queue: %w", err)
+	}
+
+	// Bind the main queue to the main exchange
 	err = ch.QueueBind(
 		q.Name,       // Queue name
 		q.Name,       // Routing key (same as queue name for direct exchange)
@@ -85,10 +135,25 @@ func NewWorker(handler MessageHandler) (*Worker, error) {
 		return nil, fmt.Errorf("failed to bind queue to exchange: %w", err)
 	}
 
+	// Bind the retry queue to the delay exchange
+	err = ch.QueueBind(
+		retryQueue.Name,   // Queue name
+		retryQueue.Name,   // Routing key
+		delayExchangeName, // Exchange
+		false,             // No-wait
+		nil,               // Arguments
+	)
+	if err != nil {
+		ch.Close()
+		conn.Close()
+		return nil, fmt.Errorf("failed to bind retry queue to delay exchange: %w", err)
+	}
+
 	return &Worker{
 		conn:          conn,
 		channel:       ch,
 		queue:         q,
+		retryQueue:    retryQueue,
 		handleMessage: handler,
 	}, nil
 }
@@ -141,11 +206,28 @@ func (w *Worker) StartConsuming() error {
 	forever := make(chan bool)
 	go func() {
 		for msg := range msgs {
-
 			// Process the message here
-			w.processMessage(msg)
+			retryCount := getRetryCount(msg.Headers)
+			extra_data := map[string]interface{}{
+				"retry_count": retryCount,
+			}
+			err := w.processMessage(msg, extra_data)
 
-			msg.Ack(false) // Acknowledge message after processing
+			if err != nil {
+				// Handle failed processing
+				if retryCount < maxRetries {
+					w.scheduleRetry(msg, retryCount+1)
+					fmt.Printf("Message processing failed, scheduled retry %d of %d in %v\n",
+						retryCount+1, maxRetries, retryDelay)
+				} else {
+					fmt.Printf("Message processing failed after %d retries, discarding\n", maxRetries)
+					// Could send to a dead letter queue for manual inspection here
+				}
+				msg.Ack(false) // Remove from the queue regardless of success
+			} else {
+				// Process succeeded
+				msg.Ack(false)
+			}
 		}
 	}()
 
@@ -156,10 +238,70 @@ func (w *Worker) StartConsuming() error {
 }
 
 // processMessage handles an incoming message
-func (w *Worker) processMessage(msg amqp.Delivery) {
+func (w *Worker) processMessage(msg amqp.Delivery, extra_data map[string]interface{}) error {
 	// Call the handler function with the message body
 	if w.handleMessage != nil {
-		w.handleMessage(string(msg.Body))
+		return w.handleMessage(string(msg.Body), extra_data)
+	}
+	return nil
+}
+
+// getRetryCount extracts the retry count from message headers
+func getRetryCount(headers amqp.Table) int {
+	if headers == nil {
+		return 0
+	}
+
+	if retryCount, exists := headers["x-retry-count"]; exists {
+		switch count := retryCount.(type) {
+		case int:
+			return count
+		case int32:
+			return int(count)
+		case int64:
+			return int(count)
+		case string:
+			if i, err := strconv.Atoi(count); err == nil {
+				return i
+			}
+		}
+	}
+
+	return 0
+}
+
+// scheduleRetry republishes a message for retry with updated retry count
+func (w *Worker) scheduleRetry(msg amqp.Delivery, retryCount int) {
+	// Prepare headers for the retry
+	headers := amqp.Table{}
+
+	// Copy existing headers
+	if msg.Headers != nil {
+		for k, v := range msg.Headers {
+			headers[k] = v
+		}
+	}
+
+	// Update retry count
+	headers["x-retry-count"] = retryCount
+
+	// Publish to the dead letter exchange to trigger the delay mechanism
+	err := w.channel.Publish(
+		"",                // Exchange (default exchange)
+		w.retryQueue.Name, // Routing key (queue name)
+		false,             // Mandatory
+		false,             // Immediate
+		amqp.Publishing{
+			Headers:         headers,
+			ContentType:     msg.ContentType,
+			ContentEncoding: msg.ContentEncoding,
+			Body:            msg.Body,
+			DeliveryMode:    msg.DeliveryMode, // Persistent/transient message
+		},
+	)
+
+	if err != nil {
+		log.Printf("Failed to schedule retry: %v", err)
 	}
 }
 
